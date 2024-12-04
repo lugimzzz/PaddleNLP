@@ -1891,21 +1891,6 @@ class Trainer:
 
             optimizer_cls = AdamW
             optimizer_kwargs.update(adam_kwargs)
-        elif args.optim == OptimizerNames.ADAMW_PYTHON:
-            from .adamw import AdamWPython
-
-            optimizer_cls = AdamWPython
-            optimizer_kwargs.update(adam_kwargs)
-        elif args.optim == OptimizerNames.ADAMW_MERGE:
-            from .adamw_merge import AdamWMerge
-
-            optimizer_cls = AdamWMerge
-            optimizer_kwargs.update(adam_kwargs)
-        elif args.optim == OptimizerNames.ADAMW_MINI:
-            from .adamw_mini import AdamWMini
-
-            optimizer_cls = AdamWMini
-            optimizer_kwargs.update(adam_kwargs)
         else:
             raise ValueError(f"Trainer cannot instantiate unsupported optimizer: {args.optim}")
         return optimizer_cls, optimizer_kwargs

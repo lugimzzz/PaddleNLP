@@ -317,9 +317,6 @@ class OptimizerNames(ExplicitEnum):
 
     ADAMW = "adamw"
     ADAFACTOR = "adafactor"
-    ADAMW_PYTHON = "adamw_python"
-    ADAMW_MERGE = "adamw_merge"
-    ADAMW_MINI = "adamw_mini"
 
 
 class ShardingOption(ExplicitEnum):

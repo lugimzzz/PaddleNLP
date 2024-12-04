@@ -14,6 +14,7 @@
 from collections import OrderedDict, defaultdict
 
 import paddle
+import paddle.nn as nn
 import paddle.nn.functional as F
 from paddle.distributed import fleet
 
@@ -49,6 +50,8 @@ class DPOTrainer(Trainer):
         self,
         model,
         data_collator,
+        adamw_merge_args=None,
+        tau_ref_state_dict=None,
         dpo_criterion=None,
         ref_model=None,
         dpo_config=None,
@@ -59,6 +62,8 @@ class DPOTrainer(Trainer):
         **kwargs
     ):
         super().__init__(model, data_collator=data_collator, **kwargs)
+        self.adamw_merge_args = adamw_merge_args
+        self.tau_ref_state_dict = tau_ref_state_dict
         if dpo_config is None:
             raise ValueError("dpo_config is None")
         else:
@@ -520,6 +525,56 @@ class DPOTrainer(Trainer):
                     group=self.model_wrapped.pp_group,
                 )
             setattr(infohub, key, tensor)
+
+    def create_optimizer(self, lr_scheduler=None):
+        """
+        Setup the optimizer.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        """
+        if self.optimizer is None:
+            if self.optimizer_grouped_parameters is not None:
+                params = self.optimizer_grouped_parameters
+                apply_decay_param_fun = None
+            else:
+                params = self.model.parameters()
+                decay_parameters = [
+                    p.name for n, p in self.model.named_parameters() if not any(nd in n for nd in ["bias", "norm"])
+                ]
+
+                def apply_decay_param_fun(x):
+                    return x in decay_parameters
+
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            if hasattr(optimizer_cls, "_create_master_weight") and self.args.fp16_opt_level == "O2":
+                optimizer_kwargs["multi_precision"] = True
+            if self.adamw_merge_args is not None:
+                if self.adamw_merge_args.merge_type == "python":
+                    from .optimizer import AdamWPython
+
+                    optimizer_cls = AdamWPython
+                elif self.adamw_merge_args.merge_type in ["ondare", "onties"]:
+                    from .optimizer import AdamWMerge
+
+                    optimizer_cls = AdamWMerge
+                    optimizer_kwargs["reserve_p"] = self.adamw_merge_args.merge_reserve_p
+                    optimizer_kwargs["alpha"] = self.adamw_merge_args.merge_alpha
+                    optimizer_kwargs["rescale"] = self.adamw_merge_args.merge_rescale
+                    optimizer_kwargs["clip_val"] = self.adamw_merge_args.merge_clip_val
+                    optimizer_kwargs["merge_type"] = self.adamw_merge_args.merge_type
+                    optimizer_kwargs["merge_type"] = self.tau_ref_state_dict
+
+            self.optimizer = optimizer_cls(
+                learning_rate=self.lr_scheduler if lr_scheduler is None else lr_scheduler,
+                apply_decay_param_fun=apply_decay_param_fun,
+                parameters=params,
+                weight_decay=self.args.weight_decay,
+                grad_clip=nn.ClipGradByGlobalNorm(self.args.max_grad_norm) if self.args.max_grad_norm > 0 else None,
+                **optimizer_kwargs,
+            )
+
+        return self.optimizer
 
 
 def prepare_pipeline_dpo_inputs_func(inputs):
