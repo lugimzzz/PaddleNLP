@@ -125,11 +125,11 @@ def main():
         recompute_granularity=model_args.recompute_granularity,
         use_flash_attention=model_args.use_flash_attention,
         tensor_parallel_output=model_args.tensor_parallel_output,
-        dpo_config=dpo_config,
     )
 
     if training_args.pipeline_parallel_degree > 1:
         model_class = AutoModelForCausalLMPipe
+        model_kwargs["dpo_config"] = dpo_config
     else:
         model_class = AutoModelForCausalLM
     if not training_args.autotuner_benchmark or model_args.weight_quantize_algo is not None:
@@ -148,7 +148,8 @@ def main():
             ref_model = model_class.from_config(config, dtype=dtype)
         else:
             ref_model = None
-    model.config.dpo_config = None
+    if training_args.pipeline_parallel_degree > 1:
+        model.config.dpo_config = None
     if model_args.flash_mask and not model.config.use_flash_attention:
         logger.warning("`flash_mask` must use with zero padding and flash attention.")
         model.config.use_flash_attention = True
