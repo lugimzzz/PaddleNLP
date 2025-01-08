@@ -50,8 +50,8 @@ class DPOTrainer(Trainer):
         self,
         model,
         data_collator,
-        adamw_merge_args=None,
-        tau_ref_state_dict=None,
+        online_merge_args=None,
+        base_model=None,
         dpo_criterion=None,
         ref_model=None,
         dpo_config=None,
@@ -62,8 +62,7 @@ class DPOTrainer(Trainer):
         **kwargs
     ):
         super().__init__(model, data_collator=data_collator, **kwargs)
-        self.adamw_merge_args = adamw_merge_args
-        self.tau_ref_state_dict = tau_ref_state_dict
+
         if dpo_config is None:
             raise ValueError("dpo_config is None")
         else:
@@ -120,7 +119,22 @@ class DPOTrainer(Trainer):
         if self.compute_metrics is not None:
             raise NotImplementedError("compute_metrics is not supported for DPOTrainer")
         self.reset_dpo_infohub()
-
+        self.online_merge_args = online_merge_args
+        self.base_model = base_model
+        if self.online_merge_args.online_merge:
+            if self.base_model is None:
+                raise ValueError("Online merging optimizers requires base_model")
+            self.tau_ref_state_dict = self.get_tau_ref_state_dict()
+    
+    def get_tau_ref_state_dict(self):
+        """get tau_ref_state_dict"""
+        tau_ref_state_dict = {}
+        for key in self.model.state_dict():
+            tau_ref_state_dict[self.model.state_dict()[key].name] = self.ref_model.state_dict()[key] - self.base_model.state_dict()[key]
+        del self.base_model
+        paddle.device.cuda.empty_cache()
+        return tau_ref_state_dict
+    
     def get_batch_metrics(self, ref_model, model, batch, train_eval="train"):
         """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
         dpo_inputs = {
@@ -551,21 +565,11 @@ class DPOTrainer(Trainer):
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
             if hasattr(optimizer_cls, "_create_master_weight") and self.args.fp16_opt_level == "O2":
                 optimizer_kwargs["multi_precision"] = True
-            if self.adamw_merge_args is not None:
-                if self.adamw_merge_args.merge_type == "python":
-                    from .optimizer import AdamWPython
-
-                    optimizer_cls = AdamWPython
-                elif self.adamw_merge_args.merge_type in ["ondare", "onties"]:
-                    from .optimizer import AdamWMerge
-
-                    optimizer_cls = AdamWMerge
-                    optimizer_kwargs["reserve_p"] = self.adamw_merge_args.merge_reserve_p
-                    optimizer_kwargs["alpha"] = self.adamw_merge_args.merge_alpha
-                    optimizer_kwargs["rescale"] = self.adamw_merge_args.merge_rescale
-                    optimizer_kwargs["clip_val"] = self.adamw_merge_args.merge_clip_val
-                    optimizer_kwargs["merge_type"] = self.adamw_merge_args.merge_type
-                    optimizer_kwargs["merge_type"] = self.tau_ref_state_dict
+            if self.online_merge_args.online_merge:
+                from .optimizer import AdamWMerge
+                optimizer_cls = AdamWMerge
+                optimizer_kwargs["online_merge_args"] = self.online_merge_args
+                optimizer_kwargs["tau_ref_state_dict"] = self.tau_ref_state_dict
 
             self.optimizer = optimizer_cls(
                 learning_rate=self.lr_scheduler if lr_scheduler is None else lr_scheduler,
