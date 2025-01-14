@@ -35,65 +35,58 @@ except:
     qlora_weight_quantize = None
 
 
-def replace_with_quantization_linear(model, quantization_config, name_prefix="", llm_int8_threshold=6.0):
+def replace_with_quantization_linear(model, quantization_config, llm_int8_threshold=6.0):
     quantization_linear_list = []
-    for name, child in model.named_children():
-        if isinstance(child, nn.Linear):
+    for name, child in model.named_sublayers():
+        if "output_linear" in name:
+            continue
+        if any(
+            isinstance(child, linear_class) for linear_class in [nn.Linear, ColumnParallelLinear, RowParallelLinear]
+        ):
             if child.bias is None:
                 bias_attr = False
             else:
                 bias_attr = None
+            parent = model
+            *path, last = name.split(".")
+            for attr in path:
+                parent = getattr(parent, attr)
+            if isinstance(child, nn.Linear):
+                quant_linear = QuantizationLinear(
+                    child.weight.shape[0],
+                    child.weight.shape[1],
+                    quantization_config.weight_quantize_algo,
+                    child._dtype,
+                    bias_attr=bias_attr,
+                    llm_int8_threshold=llm_int8_threshold,
+                    block_size=quantization_config.weight_blocksize,
+                    double_quant_block_size=quantization_config.weight_double_quant_block_size,
+                    double_quant=quantization_config.weight_double_quant,
+                )
+            elif isinstance(child, ColumnParallelLinear):
+                quant_linear = ColumnParallelQuantizationLinear(
+                    child.weight.shape[0],
+                    child.weight.shape[1] * child.world_size,
+                    quantization_config.weight_quantize_algo,
+                    child._dtype,
+                    bias_attr=bias_attr,
+                    gather_output=child.gather_output,
+                    llm_int8_threshold=llm_int8_threshold,
+                )
+            elif isinstance(child, RowParallelLinear):
+                quant_linear = RowParallelQuantizationLinear(
+                    child.weight.shape[0] * child.world_size,
+                    child.weight.shape[1],
+                    quantization_config.weight_quantize_algo,
+                    child._dtype,
+                    bias_attr=bias_attr,
+                    input_is_parallel=child.input_is_parallel,
+                    llm_int8_threshold=llm_int8_threshold,
+                )
 
-            model._sub_layers[name] = QuantizationLinear(
-                child.weight.shape[0],
-                child.weight.shape[1],
-                quantization_config.weight_quantize_algo,
-                child._dtype,
-                bias_attr=bias_attr,
-                llm_int8_threshold=llm_int8_threshold,
-                block_size=quantization_config.weight_blocksize,
-                double_quant_block_size=quantization_config.weight_double_quant_block_size,
-                double_quant=quantization_config.weight_double_quant,
-            )
             del child
-            quantization_linear_list.append(name_prefix + name)
-        elif isinstance(child, ColumnParallelLinear):
-            if child.bias is None:
-                bias_attr = False
-            else:
-                bias_attr = None
-            model._sub_layers[name] = ColumnParallelQuantizationLinear(
-                child.weight.shape[0],
-                child.weight.shape[1] * child.world_size,
-                quantization_config.weight_quantize_algo,
-                child._dtype,
-                bias_attr=bias_attr,
-                gather_output=child.gather_output,
-                llm_int8_threshold=llm_int8_threshold,
-            )
-            del child
-            quantization_linear_list.append(name_prefix + name)
-        elif isinstance(child, RowParallelLinear):
-            if child.bias is None:
-                bias_attr = False
-            else:
-                bias_attr = None
-            model._sub_layers[name] = RowParallelQuantizationLinear(
-                child.weight.shape[0] * child.world_size,
-                child.weight.shape[1],
-                quantization_config.weight_quantize_algo,
-                child._dtype,
-                bias_attr=bias_attr,
-                input_is_parallel=child.input_is_parallel,
-                llm_int8_threshold=llm_int8_threshold,
-            )
-            del child
-            quantization_linear_list.append(name_prefix + name)
-        else:
-            quantization_linear_list += replace_with_quantization_linear(
-                child, quantization_config, name_prefix + name + ".", llm_int8_threshold
-            )
-
+            setattr(parent, last, quant_linear)
+            quantization_linear_list.append(name)
     gc.collect()
     return quantization_linear_list
 
@@ -117,12 +110,12 @@ def convert_to_quantize_state_dict_with_check(state_dict, quantization_linear_li
                     f"{quant_scale_name} should be {paddle.float16} or {paddle.bfloat16} in state_dict but received dtype {state_dict[quant_scale_name].dtype}."
                 )
         elif weight_name in state_dict:
-            target_weight = state_dict.pop(weight_name).cast(dtype)
+            target_weight = state_dict.pop(weight_name).cast(dtype).cuda()
             quant_weight, quant_scale = weight_quantize(target_weight, quant_algo)
             state_dict[quant_weight_name] = quant_weight
             state_dict[quant_scale_name] = quant_scale
             del target_weight
-        gc.collect()
+    paddle.device.cuda.empty_cache()
     return state_dict
 
 
@@ -169,7 +162,7 @@ def convert_to_quantize_state_dict(state_dict, quantization_linear_list, quantiz
         )
 
 
-def update_loaded_state_dict_keys(state_dict, quantization_linear_list, quantization_config):
+def update_loaded_state_dict_keys(state_dict, quantization_linear_list, quantization_config, ignore_warning=False):
     for name in quantization_linear_list:
         weight_name = name + ".weight"
         quant_weight_name = name + ".quant_weight"
@@ -190,8 +183,9 @@ def update_loaded_state_dict_keys(state_dict, quantization_linear_list, quantiza
             else:
                 state_dict.append(quant_scale_name)
         else:
-            logger.warning(
-                f"Cannot find {weight_name} in state_dict or {quant_weight_name}  and {quant_scale_name} in state_dict"
-            )
+            if not ignore_warning:
+                logger.warning(
+                    f"Cannot find {weight_name} in state_dict or {quant_weight_name}  and {quant_scale_name} in state_dict"
+                )
 
     return state_dict

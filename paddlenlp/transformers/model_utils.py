@@ -1888,18 +1888,6 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
             loaded_keys = update_loaded_state_dict_keys(
                 loaded_keys, quantization_linear_list, config.quantization_config
             )
-            if state_dict is not None:
-                state_dict = convert_to_quantize_state_dict(
-                    state_dict,
-                    quantization_linear_list,
-                    config.quantization_config,
-                    dtype,
-                )
-                loaded_keys = [k for k in state_dict.keys()]
-            else:
-                loaded_keys = update_loaded_state_dict_keys(
-                    loaded_keys, quantization_linear_list, config.quantization_config
-                )
             if keep_in_fp32_modules is None:
                 keep_in_fp32_modules = (
                     ["quant_scale"] if config.quantization_config.weight_quantize_algo in ["nf4", "fp4"] else None
@@ -2012,10 +2000,10 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                     dtype,
                 )
                 new_keys = update_loaded_state_dict_keys(
-                    new_keys, quantization_linear_list, config.quantization_config
+                    new_keys, quantization_linear_list, config.quantization_config, ignore_warning=True
                 )
                 fused_keys = update_loaded_state_dict_keys(
-                    fused_keys, quantization_linear_list, config.quantization_config
+                    fused_keys, quantization_linear_list, config.quantization_config, ignore_warning=True
                 )
             missing_keys = list(set(missing_keys) - set(new_keys))
             unexpected_keys = list(set(unexpected_keys) - set(fused_keys))
@@ -2132,10 +2120,10 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                         dtype,
                     )
                     new_keys = update_loaded_state_dict_keys(
-                        new_keys, quantization_linear_list, config.quantization_config
+                        new_keys, quantization_linear_list, config.quantization_config, ignore_warning=True
                     )
                     fused_keys = update_loaded_state_dict_keys(
-                        fused_keys, quantization_linear_list, config.quantization_config
+                        fused_keys, quantization_linear_list, config.quantization_config, ignore_warning=True
                     )
                 missing_keys = list(set(missing_keys) - set(new_keys))
                 unexpected_keys = list(set(unexpected_keys) - set(fused_keys))
@@ -2487,11 +2475,13 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         quantization_linear_list = None
         if config.quantization_config.is_weight_quantize():
             with ContextManagers(quantization_init_contexts):
+                logger.info("replace start")
                 quantization_linear_list = replace_with_quantization_linear(
                     model=model,
                     quantization_config=config.quantization_config,
                     llm_int8_threshold=config.quantization_config.llm_int8_threshold,
                 )
+                logger.info("replace end")
                 quantization_linear_list = []
                 for key in model.state_dict().keys():
                     if "quant_weight" in key:
