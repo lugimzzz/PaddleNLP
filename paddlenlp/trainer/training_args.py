@@ -37,6 +37,7 @@ from .trainer_utils import (
     OptimizerNames,
     SchedulerType,
     ShardingOption,
+    split_parallel_config,
 )
 
 __all__ = [
@@ -631,6 +632,13 @@ class TrainingArguments:
             )
         },
     )
+    sequence_parallel: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable sequence parallel."},
+    )
+    fuse_sequence_parallel_allreduce: bool = field(
+        default=False, metadata={"help": "Whether to use fuse sequence parallel allreduce."}
+    )
     sequence_parallel_config: str = field(
         default="",
         metadata={
@@ -840,10 +848,15 @@ class TrainingArguments:
                 "- skip_save_model_weight: do not save model weights when the masters weight exist\n"
                 "- master_weight_compatible: 1. if the master weights exist, only load when needed\n"
                 "                            2. if master weights does not exist, convert model weights to master weights when needed\n"
+                "- remove_master_weight: same with `master_weight_compatible`, use in checkpoint quantization.\n"
                 "- async_save: enable asynchronous saving checkpoints to disk\n"
                 "- enable_all_options: enable all optimization configurations\n"
             )
         },
+    )
+    ckpt_quant_stage: str = field(
+        default="O0",
+        metadata={"help": "checkpoint quantization stage."},
     )
     ignore_load_lr_and_optim: Optional[bool] = field(
         default=False,
@@ -871,6 +884,10 @@ class TrainingArguments:
     skip_data_intervals: Optional[List[List[int]]] = field(
         default=None,
         metadata={"help": "The intervals to skip, pass start global step and end global step at each interval"},
+    )
+    offload_optim: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Offload optimizer after optimizer.step()"},
     )
 
     def __post_init__(self):
@@ -1069,13 +1086,6 @@ class TrainingArguments:
                 logger.warning("set amp_master_grad to false since amp is disabled.")
                 self.amp_master_grad = False
 
-        def split_parallel_config(parallel_config):
-            if "," in parallel_config:
-                parallel_config = set(parallel_config.split(","))
-            else:
-                parallel_config = set(parallel_config.split(" "))
-            return parallel_config
-
         # use_hybrid_parallel
         if self.use_hybrid_parallel:
 
@@ -1113,10 +1123,17 @@ class TrainingArguments:
                                     f"Found unknown pipeline mode config {x}, accpet config is disable_p2p_cache_shape, disable_partial_send_recv."
                                 )
 
+                    enable_partial_send_recv = "disable_partial_send_recv" not in pipeline_parallel_config
+                    if self.sequence_parallel and enable_partial_send_recv:
+                        logger.warning(
+                            "When use pipeline parallel and sequence parallel simultaneously, we should turn off partial send recv."
+                        )
+                        enable_partial_send_recv = False
+
                     strategy.pipeline_configs = {
                         "accumulate_steps": self.gradient_accumulation_steps,
                         "micro_batch_size": self.per_device_train_batch_size,
-                        "enable_partial_send_recv": "disable_partial_send_recv" not in pipeline_parallel_config,
+                        "enable_partial_send_recv": enable_partial_send_recv,
                         "p2p_cache_shape": False if "disable_p2p_cache_shape" in pipeline_parallel_config else True,
                         # "delay_scale_loss": True, Fix ME
                     }
@@ -1127,29 +1144,20 @@ class TrainingArguments:
                         or "enable_dp_comm_overlap" in pipeline_parallel_config
                     )
                     enable_dp_comm_overlap = using_comm_overlap and self.data_parallel_degree > 1
-                    enable_sharding_comm_overlap = using_comm_overlap and self.sharding_parallel_degree > 1
+                    self.enable_sharding_comm_overlap = using_comm_overlap and self.sharding_parallel_degree > 1
                     assert not (
-                        enable_dp_comm_overlap and enable_sharding_comm_overlap
+                        enable_dp_comm_overlap and self.enable_sharding_comm_overlap
                     ), "dp_comm_overlap and sharding_comm_overlap cannot be enabled at the same time"
 
-                    if enable_sharding_comm_overlap and not self.amp_master_grad:
+                    if self.enable_sharding_comm_overlap and not self.amp_master_grad:
                         raise ValueError(
                             "If `enable_sharding_comm_overlap` in pipeline_parallel_configs, `amp_master_grad` must be True."
                         )
-                    if (
-                        enable_sharding_comm_overlap
-                        and self.unified_checkpoint
-                        and "split_param" in split_parallel_config(self.sharding_parallel_config)
-                    ):
-                        logger.warning(
-                            "Currently unified checkpoint do not support using `sharding_comm_overlap` and `split_param` at the same time, delete `sharding_comm_overlap`."
-                        )
-                        enable_sharding_comm_overlap = False
 
                     dygraph_pp_configs = {
                         "delay_scale_loss": True if "enable_delay_scale_loss" in pipeline_parallel_config else False,
                         "dp_comm_overlap": enable_dp_comm_overlap,
-                        "sharding_comm_overlap": enable_sharding_comm_overlap,
+                        "sharding_comm_overlap": self.enable_sharding_comm_overlap,
                         "enable_timer": "enable_timer" in pipeline_parallel_config,
                         "release_gradients": "enable_release_grads" in pipeline_parallel_config or self.release_grads,
                         "overlap_p2p_comm": "enable_overlap_p2p_comm" in pipeline_parallel_config,
@@ -1644,6 +1652,7 @@ class TrainingArguments:
                     if x not in [
                         "skip_save_model_weight",
                         "master_weight_compatible",
+                        "remove_master_weight",
                         "async_save",
                         "enable_all_options",
                         "ignore_merge_optimizer",

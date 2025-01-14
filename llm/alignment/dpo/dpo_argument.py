@@ -51,6 +51,15 @@ class DPOTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether to run benchmark by autotuner. True for from_scratch."},
     )
+    continue_training: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to train from existing paddlenlp model weights.\n"
+                "If set True, the model_name_or_path argument must exist in the paddlenlp models."
+            )
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()

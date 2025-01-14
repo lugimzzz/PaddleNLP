@@ -268,6 +268,7 @@ class LlmMetaConfig:
             "Recompute granularity, Choose among ['full', 'core_attn', 'full_attn']",
         ),
         ("recompute_use_reentrant", bool, False, "recompute_use_reentrant"),
+        ("offload_recompute_inputs", bool, False, "offload_recompute_inputs"),
     ]
 
     @classmethod
