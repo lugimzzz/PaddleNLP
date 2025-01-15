@@ -17,7 +17,7 @@ import math
 import paddle
 from paddle import nn
 from paddle.distributed.fleet.layers.mpu import mp_ops
-from paddle.nn.quant import weight_dequantize, weight_only_linear, weight_quantize
+from paddle.nn.quant import weight_dequantize, weight_quantize
 
 from ...quantization.qlora import qlora_weight_dequantize, qlora_weight_quantize
 from ...quantization.quantization_linear import (
@@ -25,6 +25,7 @@ from ...quantization.quantization_linear import (
     QuantizationLinear,
     RowParallelQuantizationLinear,
 )
+from .lora_quick_quant_layers import quick_lora
 from .utils import rng_ctx
 
 
@@ -108,6 +109,8 @@ class QuantizationLoRALinear(QuantizationLinear):
         self.weight = None
         self.scaling = self.lora_alpha / self.r
         self.disable_lora = False
+        if self.bias is not None:
+            self.bias.stop_gradient = True
 
     def dequantize_weight(self):
         if self.quant_algo in ["fp4", "nf4"]:
@@ -176,10 +179,21 @@ class QuantizationLoRALinear(QuantizationLinear):
             self.merged = True
 
     def forward(self, x: paddle.Tensor):
-        result = super().forward(x)
-        if not self.merged and not self.disable_lora:
-            result += (self.lora_dropout(x) @ self.lora_A @ self.lora_B) * self.scaling
-        return result
+        # result = super().forward(x)
+        # if not self.merged and not self.disable_lora:
+        #     result += (self.lora_dropout(x) @ self.lora_A @ self.lora_B) * self.scaling
+        # return result
+        return quick_lora(
+            x,
+            self.lora_A,
+            self.lora_B,
+            self.quant_weight,
+            self.quant_scale,
+            self.quant_algo,
+            self._dtype,
+            self.bias,
+            self.scaling,
+        )
 
 
 class ColumnParallelQuantizationLoRALinear(ColumnParallelQuantizationLinear):
@@ -223,9 +237,6 @@ class ColumnParallelQuantizationLoRALinear(ColumnParallelQuantizationLinear):
             raise ValueError("Lora rank r should be a positive integer")
         if self.quant_algo == "llm.int8":
             raise NotImplementedError("llm.int8 not yet support lora strategy.")
-        if self.quant_algo in ["fp4", "nf4"]:
-            raise NotImplementedError(f"{self.quant_algo} not yet support tensor parallelism.")
-
         self.r = r
         self.lora_alpha = lora_alpha
         # Optional dropout
@@ -258,19 +269,33 @@ class ColumnParallelQuantizationLoRALinear(ColumnParallelQuantizationLinear):
 
     def forward(self, x):
 
-        result_mp = super().forward(x)
+        # result_mp = super().forward(x)
 
-        if not self.disable_lora or not self.merged:
-            input_a = self.lora_dropout(x) @ self.lora_A
-            input_a_mp = mp_ops._c_identity(input_a, group=self.model_parallel_group)
-            delta_mp = (input_a_mp @ self.lora_B) * self.scaling
-            result_mp += delta_mp
+        # if not self.disable_lora or not self.merged:
+        #     input_a = self.lora_dropout(x) @ self.lora_A
+        #     input_a_mp = mp_ops._c_identity(input_a, group=self.model_parallel_group)
+        #     delta_mp = (input_a_mp @ self.lora_B) * self.scaling
+        #     result_mp += delta_mp
 
-        if self.gather_output and self.is_mp:
-            result = mp_ops._c_concat(result_mp, group=self.model_parallel_group)
-        else:
-            result = result_mp
-        return result
+        # if self.gather_output and self.is_mp:
+        #     result = mp_ops._c_concat(result_mp, group=self.model_parallel_group)
+        # else:
+        #     result = result_mp
+        # return result
+        return quick_lora(
+            x,
+            self.lora_A,
+            self.lora_B,
+            self.quant_weight,
+            self.quant_scale,
+            self.quant_algo,
+            self._dtype,
+            self.bias,
+            self.scaling,
+            is_column=True,
+            group=self.model_parallel_group,
+            world_size=self.world_size,
+        )
 
     def dequantize_weight(self):
         if self.quant_algo in ["fp4", "nf4"]:
@@ -377,8 +402,6 @@ class RowParallelQuantizationLoRALinear(RowParallelQuantizationLinear):
             raise ValueError("Lora rank r should be a positive integer")
         if self.quant_algo == "llm.int8":
             raise NotImplementedError("llm.int8 not yet support lora strategy.")
-        if self.quant_algo in ["fp4", "nf4"]:
-            raise NotImplementedError(f"{self.quant_algo} not yet support tensor parallelism.")
         self.r = r
         self.lora_alpha = lora_alpha
         # Optional dropout
@@ -411,36 +434,56 @@ class RowParallelQuantizationLoRALinear(RowParallelQuantizationLinear):
         self.merged = False
 
     def forward(self, x: paddle.Tensor):
-        if not self.input_is_parallel:
-            input_mp = mp_ops._c_split(x, group=self.model_parallel_group)
-        else:
-            input_mp = x
+        # if not self.input_is_parallel:
+        #     input_mp = mp_ops._c_split(x, group=self.model_parallel_group)
+        # else:
+        #     input_mp = x
 
-        # x @ W : [bz, in_f / ws] ===> [bz, out_f]
-        with paddle.amp.auto_cast(enable=False):
-            result_mp = weight_only_linear(input_mp, self.quant_weight, None, self.quant_scale, self.quant_dtype)
+        # # x @ W : [bz, in_f / ws] ===> [bz, out_f]
+        # with paddle.amp.auto_cast(enable=False):
+        #     result_mp = weight_only_linear(input_mp, self.quant_weight, None, self.quant_scale, self.quant_dtype)
 
-        output = mp_ops._mp_allreduce(
+        # output = mp_ops._mp_allreduce(
+        #     result_mp,
+        #     group=self.model_parallel_group,
+        #     use_calc_stream=True,
+        #     use_model_parallel=True,
+        # )
+        # if not self.disable_lora or not self.merged:
+        #     # x @ A: [bz, in_f/ ws] ===> [bz, r]
+        #     input_mp = self.lora_dropout(input_mp) @ self.lora_A
+        #     # all reduce to keep Lora B's gradient on different gpu consistent
+        #     input_dup = mp_ops._mp_allreduce(
+        #         input_mp,
+        #         group=self.model_parallel_group,
+        #         use_calc_stream=True,
+        #         use_model_parallel=True,
+        #     )
+        #     #  @ B: [bz, r] ===> [bz, out_f]
+        #     delta_mp = (input_dup @ self.lora_B) * self.scaling
+        #     output += delta_mp
+        # output = output + self.bias if self.bias is not None else output
+        # return output
+        result_mp = quick_lora(
+            x,
+            self.lora_A,
+            self.lora_B,
+            self.quant_weight,
+            self.quant_scale,
+            self.quant_algo,
+            self._dtype,
+            self.bias,
+            self.scaling,
+            is_row=True,
+            group=self.model_parallel_group,
+            world_size=self.world_size,
+        )
+        return mp_ops._mp_allreduce(
             result_mp,
             group=self.model_parallel_group,
             use_calc_stream=True,
             use_model_parallel=True,
         )
-        if not self.disable_lora or not self.merged:
-            # x @ A: [bz, in_f/ ws] ===> [bz, r]
-            input_mp = self.lora_dropout(input_mp) @ self.lora_A
-            # all reduce to keep Lora B's gradient on different gpu consistent
-            input_dup = mp_ops._mp_allreduce(
-                input_mp,
-                group=self.model_parallel_group,
-                use_calc_stream=True,
-                use_model_parallel=True,
-            )
-            #  @ B: [bz, r] ===> [bz, out_f]
-            delta_mp = (input_dup @ self.lora_B) * self.scaling
-            output += delta_mp
-        output = output + self.bias if self.bias is not None else output
-        return output
 
     def dequantize_weight(self):
         if self.quant_algo in ["fp4", "nf4"]:

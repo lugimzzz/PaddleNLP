@@ -1913,7 +1913,7 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
                 unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
 
         # Set some modules to fp32 if any
-        if keep_in_fp32_modules is not None:
+        if keep_in_fp32_modules is not None and not is_quantize:
             for name, param in model.named_parameters():
                 if any(module_to_keep_in_fp32 in name for module_to_keep_in_fp32 in keep_in_fp32_modules):
                     if param.dtype != paddle.float32:
@@ -2475,13 +2475,11 @@ class PretrainedModel(Layer, GenerationMixin, ConversionMixin):
         quantization_linear_list = None
         if config.quantization_config.is_weight_quantize():
             with ContextManagers(quantization_init_contexts):
-                logger.info("replace start")
                 quantization_linear_list = replace_with_quantization_linear(
                     model=model,
                     quantization_config=config.quantization_config,
                     llm_int8_threshold=config.quantization_config.llm_int8_threshold,
                 )
-                logger.info("replace end")
                 quantization_linear_list = []
                 for key in model.state_dict().keys():
                     if "quant_weight" in key:

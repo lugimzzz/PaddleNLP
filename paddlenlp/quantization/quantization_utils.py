@@ -142,8 +142,8 @@ def convert_to_quantize_state_dict_without_check(state_dict, quantization_linear
             )
             state_dict.update(qlora_state_dict)
             del target_weight
-            gc.collect()
-            paddle.device.cuda.empty_cache()
+    gc.collect()
+    paddle.device.cuda.empty_cache()
     return state_dict
 
 
